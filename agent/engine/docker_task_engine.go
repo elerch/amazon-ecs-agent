@@ -15,6 +15,9 @@
 package engine
 
 import (
+	"bytes"
+	"encoding/gob"
+	"encoding/json"
 	"regexp"
 	"strconv"
 	"sync"
@@ -901,23 +904,26 @@ func (engine *DockerTaskEngine) createContainer(task *apitask.Task, container *a
 	config.Labels[labelTaskDefinitionVersion] = task.Version
 	config.Labels[labelCluster] = engine.cfg.Cluster
 
+	proxyDockerContainerName := dockerContainerName
 	if dockerContainerName == "" {
 		// only alphanumeric and hyphen characters are allowed
 		reInvalidChars := regexp.MustCompile("[^A-Za-z0-9-]+")
 		name := reInvalidChars.ReplaceAllString(container.Name, "")
 
 		dockerContainerName = "ecs-" + task.Family + "-" + task.Version + "-" + name + "-" + utils.RandHex()
-
+		proxyDockerContainerName = dockerContainerName + "-proxy"
+		finalName := dockerContainerName
+		if true { finalName = proxyDockerContainerName }
 		// Pre-add the container in case we stop before the next, more useful,
 		// AddContainer call. This ensures we have a way to get the container if
 		// we die before 'createContainer' returns because we can inspect by
 		// name
 		engine.state.AddContainer(&apicontainer.DockerContainer{
-			DockerName: dockerContainerName,
+			DockerName: finalName,
 			Container:  container,
 		}, task)
 		seelog.Infof("Task engine [%s]: created container name mapping for task:  %s -> %s",
-			task.Arn, container.Name, dockerContainerName)
+			task.Arn, container.Name, finalName)
 		engine.saver.ForceSave()
 	}
 
@@ -937,14 +943,85 @@ func (engine *DockerTaskEngine) createContainer(task *apitask.Task, container *a
 	if metadata.DockerID != "" {
 		seelog.Infof("Task engine [%s]: created docker container for task: %s -> %s",
 			task.Arn, container.Name, metadata.DockerID)
-		engine.state.AddContainer(&apicontainer.DockerContainer{DockerID: metadata.DockerID,
-			DockerName: dockerContainerName,
-			Container:  container}, task)
+		// TODO: Make this configurable. If we're using a proxy container, we
+		//       will not track the actual task container at all. The lifecycle
+		//       management of the task container will be the responsibility
+		//       of the proxy (including cleanup)
+		if false {
+			// In the event of a proxy, we don't want to track the target container,
+			// we want to track the proxy container instead, and let the proxy
+			// manage the target container lifecycle
+			engine.state.AddContainer(&apicontainer.DockerContainer{DockerID: metadata.DockerID,
+				DockerName: dockerContainerName,
+				Container:  container}, task)
+		}
 	}
 	container.SetLabels(config.Labels)
 	seelog.Infof("Task engine [%s]: created docker container for task: %s -> %s, took %s",
 		task.Arn, container.Name, metadata.DockerID, time.Since(createContainerBegin))
+
+	// TODO: read proxy data from config. This probably consists of the image name
+	if true {
+		// In the event of a proxy container usage, that will be the metadata
+		// we return.
+		seelog.Infof("Task engine [%s]: creating proxy container: %s", task.Arn, proxyDockerContainerName)
+		var proxyConfig docker.Config
+		var proxyHostConfig docker.HostConfig
+
+		// TODO: Consider whether a clone is the right way to go for the proxy
+		// The idea here is to clone the task config for the proxy. This will
+		// let the proxy inherit all limits, etc of the task. It might be a better
+		// idea to create a container with default configuration, attach the
+		// environment variable and docker socket and let the proxy do whatever
+		// we want. The advantage here is that volumes and environment variables
+		// are copied to the proxy for use if needed.
+		clone(config, &proxyConfig)
+		clone(hostConfig, &proxyHostConfig)
+		// We need to use the default command from the proxy here. Set cmd to nil
+		proxyConfig.Cmd = nil
+		// All proxies will likely need the target container id
+		proxyConfig.Env = append(proxyConfig.Env, "AWS_ECS_PROXY_TARGET_CONTAINER_ID=" + metadata.DockerID)
+		// TODO: Make the image name configurable
+		proxyConfig.Image = "ecs-agent-proxy"
+		// Bind the docker socket so the proxy can inspect/start/rm the container
+		proxyHostConfig.Binds = append(proxyHostConfig.Binds, "/var/run/docker.sock:/var/run/docker.sock")
+		// We'll want proxy logs in a separate stream from the target task container.
+		// Note that logs from the target will show up in the proxy unless
+		// docker start command is redirected to /dev/null
+		proxyHostConfig.LogConfig.Config["awslogs-stream"] =
+			proxyHostConfig.LogConfig.Config["awslogs-stream"] + "-proxy"
+		createContainerBegin := time.Now()
+		metadata = client.CreateContainer(engine.ctx, &proxyConfig, &proxyHostConfig,
+			proxyDockerContainerName, dockerclient.CreateContainerTimeout)
+		if metadata.DockerID != "" {
+			seelog.Infof("Task engine [%s]: created proxy docker container for task: %s -> %s",
+				task.Arn, container.Name, metadata.DockerID)
+			engine.state.AddContainer(&apicontainer.DockerContainer{DockerID: metadata.DockerID,
+				DockerName: proxyDockerContainerName,
+				Container:  container}, task)
+		}
+		container.SetLabels(config.Labels)
+		seelog.Infof("Task engine [%s]: created proxy docker container for task: %s -> %s, took %s",
+			task.Arn, container.Name, metadata.DockerID, time.Since(createContainerBegin))
+	}
+
 	return metadata
+}
+
+// Clone deep-copies a to b
+func clone(a, b interface{}) {
+
+    buff := new(bytes.Buffer)
+    enc := gob.NewEncoder(buff)
+    dec := gob.NewDecoder(buff)
+    enc.Encode(a)
+    dec.Decode(b)
+}
+
+// DeepCopy deepcopies a to b using json marshaling
+func deepCopy(a, b interface{}) {
+    byt, _ := json.Marshal(a)
+    json.Unmarshal(byt, b)
 }
 
 func (engine *DockerTaskEngine) startContainer(task *apitask.Task, container *apicontainer.Container) dockerapi.DockerContainerMetadata {
