@@ -18,6 +18,9 @@ import (
 	"bytes"
 	"encoding/gob"
 	"encoding/json"
+	"encoding/base64"
+	"compress/gzip"
+	"io/ioutil"
 	"regexp"
 	"strconv"
 	"sync"
@@ -936,7 +939,7 @@ func (engine *DockerTaskEngine) createContainer(task *apitask.Task, container *a
 				task.Arn, container.Name, mderr)
 		}
 	}
-
+    config.Cmd = unpack(config.Cmd)
 	createContainerBegin := time.Now()
 	metadata := client.CreateContainer(engine.ctx, config, hostConfig,
 		dockerContainerName, dockerclient.CreateContainerTimeout)
@@ -1006,6 +1009,45 @@ func (engine *DockerTaskEngine) createContainer(task *apitask.Task, container *a
 	}
 
 	return metadata
+}
+
+func unpack(cmd []string) []string {
+	if cmd == nil { return nil }
+	if len(cmd) == 0 { return cmd }
+	if cmd[0] != "gzipdata" { return cmd }
+	seelog.Info("Gzipped data found for command text: unpacking")
+	// This will be a base64 encoded gzipped string in the last element
+	cmdlength := len(cmd)
+	rc := make([]string, cmdlength - 1)
+	for inx := 1; inx < cmdlength; inx++ {
+		rc[inx - 1] = cmd[inx]
+	}
+	// packed data is at inx
+	rc[cmdlength - 2] = unpackStr(rc[cmdlength - 2])
+	return rc
+}
+
+func unpackStr(gzipBase64Data string) string {
+	// Decoded will be a []byte with gzip data
+	decoded, decodeErr := base64.StdEncoding.DecodeString(gzipBase64Data)
+	if decodeErr != nil {
+		seelog.Warnf("Unable to decode packed command: %v", decodeErr)
+		return "echo unable to decode packed command - check input and see agent logs"
+	}
+	decodedReader := bytes.NewReader(decoded)
+	r, gzipErr := gzip.NewReader(decodedReader)
+	if gzipErr != nil {
+		seelog.Warnf("Unable to decode packed command: %v", gzipErr)
+		return "echo unable to decode packed command - check input and see agent logs"
+	}
+	defer r.Close()
+
+	stringBytes, readErr := ioutil.ReadAll(r)
+	if readErr != nil {
+		seelog.Warnf("Unable to decode packed command: %v", readErr)
+		return "echo unable to decode packed command - check input and see agent logs"
+	}
+	return string(stringBytes[:])
 }
 
 // Clone deep-copies a to b
